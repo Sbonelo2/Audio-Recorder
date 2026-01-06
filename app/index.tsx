@@ -5,6 +5,7 @@ import {
   Alert,
   FlatList,
   Modal,
+  Platform,
   SafeAreaView,
   StyleSheet,
   Text,
@@ -45,25 +46,35 @@ export default function Index() {
     await loadRecordings();
   };
 
-  const cleanupAudio = () => {
-    if (soundRef.current) {
-      soundRef.current.unloadAsync().catch(() => {});
-    }
-  };
-
   const loadRecordings = async () => {
     try {
       const files = await FileSystem.readDirectoryAsync(RECORDINGS_DIR);
-      const items: RecItem[] = await Promise.all(
+
+      // build map to deduplicate by uri (or name)
+      const map = new Map<string, RecItem>();
+      await Promise.all(
         files.map(async (name) => {
           const uri = RECORDINGS_DIR + name;
           const info = await FileSystem.getInfoAsync(uri);
-          const raw = info.modificationTime ?? Date.now();
+          // fallback for different info fields
+          const raw =
+            (info as any).modificationTime ?? (info as any).mtime ?? Date.now();
           const createdAt = raw < 1e12 ? raw * 1000 : raw;
-          return { name, uri, createdAt };
+          // use uri as unique key
+          map.set(uri, { name, uri, createdAt });
         })
       );
-      items.sort((a, b) => b.createdAt - a.createdAt);
+
+      const items = Array.from(map.values()).sort(
+        (a, b) => b.createdAt - a.createdAt
+      );
+
+      // debug log to console so you can inspect duplicates
+      console.log(
+        "Loaded recordings:",
+        items.map((i) => ({ name: i.name, uri: i.uri }))
+      );
+
       setRecordings(items);
     } catch (e) {
       console.warn("loadRecordings error", e);
@@ -71,8 +82,22 @@ export default function Index() {
     }
   };
 
+  const cleanupAudio = () => {
+    if (soundRef.current) {
+      soundRef.current.unloadAsync().catch(() => {});
+    }
+  };
+
   const startRecording = async () => {
     try {
+      if (Platform.OS === "web") {
+        Alert.alert(
+          "Not supported",
+          "Recording is not supported on web. Use a physical device or emulator."
+        );
+        return;
+      }
+
       const perm: any = await Audio.requestPermissionsAsync();
       const granted = perm?.granted ?? perm?.status === "granted";
       if (!granted) {
@@ -82,38 +107,87 @@ export default function Index() {
         );
         return;
       }
+
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
       });
+
       const rec = new Audio.Recording();
+      // use correct preset constant
       await rec.prepareToRecordAsync(
         Audio.RECORDING_OPTIONS_PRESET_HIGH_QUALITY
       );
       await rec.startAsync();
+      console.log("Recording started");
       setRecording(rec);
     } catch (e) {
       console.error("startRecording error", e);
       Alert.alert("Recording error", "Could not start recording.");
     }
   };
-
   const stopRecording = async () => {
     if (!recording) return;
+
     try {
       await recording.stopAndUnloadAsync();
       const uri = recording.getURI();
       setRecording(null);
-      if (!uri) return;
-      const name = `note-${Date.now()}.m4a`;
-      const dest = RECORDINGS_DIR + name;
-      await FileSystem.moveAsync({ from: uri, to: dest });
+
+      if (!uri) {
+        Alert.alert("Save failed", "Recording URI is null.");
+        return;
+      }
+
+      const filename = `note-${Date.now()}.m4a`;
+      const dest = RECORDINGS_DIR + filename;
+
+      // ✅ COPY instead of MOVE (critical fix)
+      await FileSystem.copyAsync({
+        from: uri,
+        to: dest,
+      });
+
+      // ✅ Verify file exists
+      const info = await FileSystem.getInfoAsync(dest);
+      if (!info.exists || info.size === 0) {
+        throw new Error("File copy failed");
+      }
+
       await loadRecordings();
     } catch (e) {
       console.error("stopRecording error", e);
       Alert.alert("Recording error", "Could not save recording.");
     }
   };
+
+
+  // const stopRecording = async () => {
+  //   if (!recording) return;
+  //   try {
+  //     await recording.stopAndUnloadAsync();
+  //     const uri = recording.getURI();
+  //     setRecording(null);
+  //     console.log("Recording stopped, uri=", uri);
+
+  //     if (!uri) {
+  //       Alert.alert(
+  //         "Save failed",
+  //         "Recording URI is null. Make sure you run the app on a device/emulator (not web)."
+  //       );
+  //       return;
+  //     }
+
+  //     const name = `note-${Date.now()}.m4a`;
+  //     const dest = RECORDINGS_DIR + name;
+  //     await FileSystem.moveAsync({ from: uri, to: dest });
+  //     console.log("Moved recording to", dest);
+  //     await loadRecordings();
+  //   } catch (e) {
+  //     console.error("stopRecording error", e);
+  //     Alert.alert("Recording error", "Could not save recording.");
+  //   }
+  // };
 
   const play = async (uri: string) => {
     try {
@@ -132,10 +206,10 @@ export default function Index() {
       setPlayingUri(uri);
 
       sound.setOnPlaybackStatusUpdate((status) => {
-        if (!status) return;
+        if (!status || !status.isLoaded) return;
         setPosition(status.positionMillis ?? 0);
         setDuration(status.durationMillis ?? 0);
-        if ((status as any).didJustFinish) {
+        if (status.didJustFinish) {
           stopPlayback();
         }
       });
@@ -320,6 +394,7 @@ export default function Index() {
                 style={styles.modalInput}
                 placeholder="Enter new name"
                 placeholderTextColor="#999"
+                autoFocus
               />
               <View style={styles.modalButtons}>
                 <TouchableOpacity
