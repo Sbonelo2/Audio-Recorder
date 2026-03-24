@@ -1,5 +1,6 @@
 import { Audio } from 'expo-av';
 import * as FileSystem from 'expo-file-system';
+import * as FileSystemLegacy from 'expo-file-system/legacy';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
     Alert,
@@ -38,6 +39,11 @@ export default function AudioRecorderApp() {
   const [searchQuery, setSearchQuery] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
+  // Recording timer states
+  const [recordingStartTime, setRecordingStartTime] = useState<number | null>(null);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const [recordingTimer, setRecordingTimer] = useState<number | null>(null);
+
   // Refs for cleanup
   const recordingRef = useRef<Audio.Recording | null>(null);
   const soundRef = useRef<Audio.Sound | null>(null);
@@ -51,13 +57,51 @@ export default function AudioRecorderApp() {
     soundRef.current = sound;
   }, [sound]);
 
+  // Cleanup recording timer on unmount
+  useEffect(() => {
+    return () => {
+      if (recordingTimer) {
+        clearInterval(recordingTimer);
+      }
+    };
+  }, [recordingTimer]);
+
   // Recording directory
   const RECORDING_DIR = ((FileSystem as any).documentDirectory ?? '') + 'voice-notes/';
   
   // Debug: Log the recording directory
   console.log('Recording directory:', RECORDING_DIR);
   
-  // Load voice notes function
+  // Format recording time
+  const formatRecordingTime = (milliseconds: number) => {
+    const seconds = Math.floor(milliseconds / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+  };
+
+  // Start recording timer
+  const startRecordingTimer = () => {
+    const startTime = Date.now();
+    setRecordingStartTime(startTime);
+    
+    const timer = setInterval(() => {
+      const elapsed = Date.now() - startTime;
+      setRecordingDuration(elapsed);
+    }, 100);
+    
+    setRecordingTimer(timer);
+  };
+
+  // Stop recording timer
+  const stopRecordingTimer = () => {
+    if (recordingTimer) {
+      clearInterval(recordingTimer);
+      setRecordingTimer(null);
+    }
+    setRecordingStartTime(null);
+    setRecordingDuration(0);
+  };
   const loadVoiceNotes = useCallback(async () => {
     // Prevent concurrent loading
     if (isLoading) {
@@ -187,7 +231,7 @@ export default function AudioRecorderApp() {
     try {
       // Create recording directory using legacy API to avoid deprecation warning
       const recordingDir = ((FileSystem as any).documentDirectory ?? '') + 'voice-notes/';
-      await (FileSystem as any).makeDirectoryAsync(recordingDir, { intermediates: true });
+      await FileSystemLegacy.makeDirectoryAsync(recordingDir, { intermediates: true });
       
       // Clean up any duplicate files before loading
       await cleanupDuplicateFiles();
@@ -245,19 +289,24 @@ export default function AudioRecorderApp() {
       await Audio.setAudioModeAsync({
         allowsRecordingIOS: true,
         playsInSilentModeIOS: true,
+        shouldDuckAndroid: true,
+        playThroughEarpieceAndroid: false,
       });
 
       // Use the preset recording options
       const recordingOptions = (Audio as any).RECORDING_OPTIONS_PRESET_HIGH_QUALITY;
 
       console.log('Creating recording with options:', recordingOptions);
-      const { recording } = await Audio.Recording.createAsync(recordingOptions);
+      const { recording: newRecording } = await Audio.Recording.createAsync(recordingOptions);
       console.log('Recording created successfully');
       
-      setRecording(recording);
+      // Start the timer
+      startRecordingTimer();
+      
+      setRecording(newRecording);
       setIsRecording(true);
       
-      Alert.alert('Recording Started', 'Tap the button again to stop recording.');
+      console.log('Recording started successfully with timer');
     } catch (error: any) {
       console.error('Error starting recording:', error);
       Alert.alert('Error', `Failed to start recording: ${error?.message || 'Unknown error'}`);
@@ -271,6 +320,9 @@ export default function AudioRecorderApp() {
       console.log('Stopping recording...');
       setIsRecording(false);
       
+      // Stop the timer first
+      stopRecordingTimer();
+      
       await recording.stopAndUnloadAsync();
       console.log('Recording stopped and unloaded');
       
@@ -281,7 +333,7 @@ export default function AudioRecorderApp() {
         // Ensure recording directory exists
         console.log('Ensuring directory exists:', RECORDING_DIR);
         const recordingDir = ((FileSystem as any).documentDirectory ?? '') + 'voice-notes/';
-        await (FileSystem as any).makeDirectoryAsync(recordingDir, { intermediates: true }).catch(() => {});
+        await FileSystemLegacy.makeDirectoryAsync(recordingDir, { intermediates: true }).catch(() => {});
         
         // Check if source file exists
         const sourceInfo = await FileSystem.getInfoAsync(uri);
@@ -316,7 +368,9 @@ export default function AudioRecorderApp() {
             // Reload voice notes
             await loadVoiceNotes();
             
-            Alert.alert('Success', 'Voice note saved successfully!');
+            // Show success message with recording duration
+            const durationText = formatRecordingTime(recordingDuration);
+            Alert.alert('Success', `Voice note saved successfully!\nRecording duration: ${durationText}`);
           } else {
             Alert.alert('Error', 'File move verification failed.');
           }
@@ -339,7 +393,9 @@ export default function AudioRecorderApp() {
               // Reload voice notes
               await loadVoiceNotes();
               
-              Alert.alert('Success', 'Voice note saved successfully!');
+              // Show success message with recording duration
+              const durationText = formatRecordingTime(recordingDuration);
+              Alert.alert('Success', `Voice note saved successfully!\nRecording duration: ${durationText}`);
             } else {
               Alert.alert('Error', 'File copy verification failed.');
             }
@@ -507,7 +563,10 @@ App Version: 1.0.0
         {isRecording && (
           <View style={styles.recordingIndicator}>
             <View style={styles.recordingDot} />
-            <Text style={styles.recordingText}>Recording in progress...</Text>
+            <View style={styles.recordingTimeContainer}>
+              <Text style={styles.recordingText}>Recording in progress...</Text>
+              <Text style={styles.recordingTime}>{formatRecordingTime(recordingDuration)}</Text>
+            </View>
           </View>
         )}
       </View>
@@ -653,6 +712,16 @@ const styles = StyleSheet.create({
     color: '#ff4757',
     fontSize: 14,
     fontWeight: '500',
+  },
+  recordingTimeContainer: {
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+  },
+  recordingTime: {
+    color: '#ff4757',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginTop: 4,
   },
   listContainer: {
     flex: 1,
